@@ -1,0 +1,40 @@
+#!/bin/bash
+
+set -e
+
+export SPACK_COLOR=always
+
+{% for name, value in envvars.items() %}
+export {{ name }}='{{ value }}'
+{% endfor %}
+
+export prefix={{ prefix }}
+export env={{ env_path }}
+cd $prefix
+
+echo === concretizing ======================================
+echo
+spack -e $env concretize -f
+
+echo
+echo === generating Makefile ===============================
+echo
+spack -e $env env depfile -o $env/Makefile
+
+echo
+echo === building ==========================================
+echo
+make -j32 -f $env/Makefile --output-sync=recurse
+
+echo
+echo == generating modules =================================
+echo
+# use the variant with --upstream-modules to generate comprehensive modules
+#spack module tcl refresh --upstream-modules --delete-tree --yes-to-all
+spack module tcl refresh --upstream-modules --delete-tree --yes-to-all
+
+echo
+echo == generating view =====================================
+echo
+spack env activate --with-view default --sh $env > activate.sh
+

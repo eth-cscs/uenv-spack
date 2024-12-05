@@ -1,0 +1,245 @@
+#!/usr/bin/python3
+
+import pathlib
+import sys
+
+tool_prefix = pathlib.Path(__file__).parent.resolve()
+external = tool_prefix / 'external'
+sys.path = [tool_prefix.as_posix(), external.as_posix()] + sys.path
+
+import argparse
+import jinja2
+import json
+import os
+import shutil
+import stat
+import subprocess
+import yaml
+
+def red(msg):
+    return f"\033[31m{msg}\033[0m"
+def green(msg):
+    return f"\033[32m{msg}\033[0m"
+def yellow(msg):
+    return f"\033[33m{msg}\033[0m"
+def cyan(msg):
+    return f"\033[36m{msg}\033[0m"
+
+def echo(cmd):
+    print(cyan(f"{cmd}"))
+def cmnt(cmd):
+    print(green(f"{cmd}"))
+
+def error(msg):
+    """print a formatted error message and exit with error code 1"""
+    print(f"{red('[error]')} {msg}")
+    exit(1)
+
+def get_arg_parser():
+    """generate and return the command line argument parser"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("prefix", help="the path in which to set up the installation", type=str)
+    parser.add_argument("--overwrite", action="store_true", help="delete the prefix path if it exists")
+    parser.add_argument("--uarch", help="one of [zen2, zen3, gh200, a100]", type=str, required=True)
+
+    return parser
+
+def get_spack_uenv():
+    """return the spack configuration if running inside a uenv with --view=spack
+
+    returns None if not inside a uenv
+    otherwise returns a dictionary with fields:
+    * "config-path": the configuration path
+    * "commit": the spack commit
+    * "url": the spack url
+    * "ref": the spack reference, e.g. a tag or branch name (may be None)
+    """
+
+    result = {}
+
+    result["config-path"] = os.getenv("UENV_SPACK_CONFIG_PATH")
+    if result["config-path"] is None:
+        return None
+
+    cmt = os.getenv("UENV_SPACK_COMMIT")
+    if cmt is None:
+        return None
+
+    # there was a bug in stackinator that prepended a 'b' character to the
+    # start of commit hashes - check for such hashes and fix the hash.
+    if len(cmt)==41 and cmt[0]=='b':
+        release["commit"] = cmt[1:]
+    else:
+        result["commit"] = cmt
+
+    result["url"] = os.getenv("UENV_SPACK_URL")
+    if result["url"] is None:
+        return None
+
+    result["ref"] = os.getenv("UENV_SPACK_REF")
+
+    return result
+
+def quick_subproc(args):
+    echo(' '.join(args))
+
+    capture = subprocess.run(
+        args,
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    if capture.returncode != 0:
+        capture.check_returncode()
+
+    return capture.stdout.decode("utf-8")
+
+def setup_spack(prefix, config):
+    """clone and switch to the correct branch/commit of spack, in the location prefix/spack"""
+
+    spack_path = str(prefix / "spack")
+    quick_subproc(["git", "clone", "--filter=tree:0", config["url"], spack_path])
+    quick_subproc(["git", "-C", spack_path, "fetch", "origin", config["commit"]])
+    if config["ref"] is None:
+        commit = config["commit"]
+    else:
+        commit = config["ref"]
+    quick_subproc(["git", "-C", spack_path, "checkout", commit],)
+
+if __name__ == "__main__":
+    # create the jinja2 template engine up front
+    template_env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(tool_prefix / "resources"),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    # parse CLI arguments
+    parser = get_arg_parser()
+    args = parser.parse_args()
+
+    # check the arguments
+    available_uarch = ["zen2", "zen3", "gh200", "a100"]
+    if args.uarch not in available_uarch:
+        error(f"--uarch={args.uarch} is not one of [{', '.join(available_uarch)}]")
+
+    #
+    # parse the environment variables set by --view=spack
+    #
+    spack_config = get_spack_uenv()
+    if spack_config is None:
+        error("run in a uenv with spack configured")
+
+    print(f"============== spack configuration ==============")
+    print(f"spack config: {spack_config['config-path']}")
+    print(f"spack url:    {spack_config['url']}")
+    print(f"spack commit: {spack_config['commit']}")
+    if spack_config["ref"] is not None:
+        print(f"spack ref:    {spack_config['ref']}")
+    print(f"=================================================")
+
+    #
+    # create the working path for the user installation
+    #
+    prefix = pathlib.Path(os.path.abspath(args.prefix))
+    if os.path.exists(prefix):
+        if not args.overwrite:
+            error(f"the path {prefix} already exists")
+        shutil.rmtree(prefix)
+
+    print(f"prefix path: {prefix}")
+    print(f"tool   path: {tool_prefix}")
+    try:
+        echo(f"mkdir -p {prefix}")
+        os.makedirs(prefix)
+    except PermissionError:
+        error(f"you do not have permission to create {prefix}")
+
+    print(f"================= spack init ====================")
+    setup_spack(prefix, spack_config)
+
+    #
+    # create a spack config path
+    # this is a copy of the config path provided by the uenv
+    # we create a copy so that we can add additional configuration, like modules.yaml
+    #
+
+    spack_config_path = prefix / "config"
+    try:
+        shutil.copytree(spack_config["config-path"], spack_config_path)
+    except OSError as err:
+        error(f"unable to create spack config path {spack_config_path}: {err}")
+
+    # copy the modules.yaml file
+    modules_template = template_env.get_template("modules.yaml")
+    with (spack_config_path / "modules.yaml").open(mode="w") as f:
+        f.write(modules_template.render(prefix=prefix))
+
+    #
+    # set SPACK environment variables
+    #
+    envvars = {
+        "PATH":                    f"{prefix}/spack/bin:{os.getenv('PATH','')}",
+        "SPACK_USER_CONFIG_PATH":  f"{prefix}/user-config",
+        "SPACK_SYSTEM_CONFIG_PATH":f"{prefix}/config",
+        "SPACK_USER_CACHE_PATH":   f"{prefix}/cache",
+    }
+    for name, value in envvars.items():
+        echo(f"export {name}='{value}'")
+        os.environ[name] = value
+
+    #
+    # create the spack env path and populate it iwth the
+    # - populate it with the tempate spack.yaml file
+    # - set the spack store path (where spack will install packages)
+    #
+    env_path = prefix / "env"
+    echo(f"mkdir {env_path}")
+    os.makedirs(env_path)
+
+    variants = {
+        "zen2":  ["+mpi"],
+        "zen3":  ["+mpi"],
+        "a100":  ["+mpi", "+cuda", "cuda_arch=80"],
+        "gh200": ["+mpi", "+cuda", "cuda_arch=90"],
+    }
+    spack_yaml_template = template_env.get_template("spack.yaml")
+    with (env_path / "spack.yaml").open(mode="w") as f:
+        f.write(
+            spack_yaml_template.render(
+                variants=variants[args.uarch],
+                prefix=prefix,
+            )
+        )
+
+    quick_subproc(["spack", "config", "--scope=user", "add", f"config:install_tree:root:{prefix}/store"])
+
+    #
+    # finished configuring
+    # now create the bash script that performs the build
+    #
+
+    build_script = prefix / "build"
+    build_template = template_env.get_template("build")
+    with (build_script).open(mode="w") as f:
+        f.write(
+            build_template.render(
+                prefix=prefix,
+                env_path=env_path,
+                envvars=envvars,
+            )
+        )
+
+    # make the build script executable
+    st = os.stat(build_script)
+    os.chmod(build_script, st.st_mode | stat.S_IEXEC)
+
+    print("\n========= configuration finished =========\n")
+    print("Next steps:\n")
+    cmnt("# go to the build directory")
+    echo(f"cd {prefix}")
+    cmnt("# edit the spack.yaml file")
+    echo("vim env/spack.yaml")
+    cmnt("# then run the build")
+    echo("./build")

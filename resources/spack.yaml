@@ -1,0 +1,21 @@
+{% set listjoiner = joiner(',') %}
+spack:
+  config:
+    deprecated: false
+  concretizer:
+    unify: true
+    reuse: true
+  specs: []
+  packages:
+    all:
+      compiler: ['gcc']
+      variants: [{% for v in variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
+    mpi:
+      require: 'cray-mpich'
+  view:
+    # https://spack.readthedocs.io/en/latest/environments.html#advanced-view-configuration
+    default:
+      # one of (run, roots, all)
+      link: run
+      root: {{ prefix }}/view
+
