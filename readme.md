@@ -4,6 +4,7 @@ A simplified workflow for using Spack to build software on top of uenv on Alps@C
 
 ```
 git clone git@github.com:eth-cscs/uenv-spack.git
+cd uenv-spack && ./bootstrap
 
 # start a uenv with the spack view
 uenv start prgenv-gnu/24.11:v1 --view=default,spack

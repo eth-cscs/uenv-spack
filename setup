@@ -41,6 +41,9 @@ def get_arg_parser():
     parser.add_argument("prefix", help="the path in which to set up the installation", type=str)
     parser.add_argument("--overwrite", action="store_true", help="delete the prefix path if it exists")
     parser.add_argument("--uarch", help="one of [zen2, zen3, gh200, a100]", type=str, required=True)
+    recipe_group = parser.add_mutually_exclusive_group()
+    recipe_group.add_argument("--recipe", help="a spack.yaml file or env path", type=str, required=False)
+    recipe_group.add_argument("--specs", help="a comma separated list of specs, e.g. 'fftw, arbor ~cuda'", type=str, required=False)
 
     return parser
 
@@ -95,6 +98,10 @@ def quick_subproc(args):
 
     return capture.stdout.decode("utf-8")
 
+def fingerprint(path):
+    exe = tool_prefix / "resources/fingerprint"
+    return quick_subproc([str(exe), str(path)])
+
 def setup_spack(prefix, config):
     """clone and switch to the correct branch/commit of spack, in the location prefix/spack"""
 
@@ -138,7 +145,6 @@ if __name__ == "__main__":
     if spack_config["ref"] is not None:
         print(f"spack ref:    {spack_config['ref']}")
     print(f"=================================================")
-
     #
     # create the working path for the user installation
     #
@@ -148,13 +154,22 @@ if __name__ == "__main__":
             error(f"the path {prefix} already exists")
         shutil.rmtree(prefix)
 
+    mount_path = pathlib.Path(os.path.realpath(spack_config["config-path"] + "/..")).resolve()
+    meta_path = mount_path / "meta"
+
     print(f"prefix path: {prefix}")
     print(f"tool   path: {tool_prefix}")
+    print(f"mount  path: {mount_path}")
+    print(f"meta   path: {meta_path}")
     try:
         echo(f"mkdir -p {prefix}")
         os.makedirs(prefix)
     except PermissionError:
         error(f"you do not have permission to create {prefix}")
+
+    # create a fingerprint
+    fp = fingerprint(meta_path) if os.path.exists(meta_path) else None
+    print(f"fingerprint = {fp}")
 
     print(f"================= spack init ====================")
     setup_spack(prefix, spack_config)
@@ -165,15 +180,20 @@ if __name__ == "__main__":
     # we create a copy so that we can add additional configuration, like modules.yaml
     #
 
-    spack_config_path = prefix / "config"
+    config_path = prefix / "config"
+    system_config_path = config_path / "system"
     try:
-        shutil.copytree(spack_config["config-path"], spack_config_path)
+        shutil.copytree(spack_config["config-path"], system_config_path)
     except OSError as err:
-        error(f"unable to create spack config path {spack_config_path}: {err}")
+        error(f"unable to create spack config path {system_config_path}: {err}")
+
+    user_config_path = config_path / "user"
+    os.makedirs(user_config_path)
+    echo(f"mkdir {user_config_path}")
 
     # copy the modules.yaml file
     modules_template = template_env.get_template("modules.yaml")
-    with (spack_config_path / "modules.yaml").open(mode="w") as f:
+    with (user_config_path / "modules.yaml").open(mode="w") as f:
         f.write(modules_template.render(prefix=prefix))
 
     #
@@ -181,8 +201,8 @@ if __name__ == "__main__":
     #
     envvars = {
         "PATH":                    f"{prefix}/spack/bin:{os.getenv('PATH','')}",
-        "SPACK_USER_CONFIG_PATH":  f"{prefix}/user-config",
-        "SPACK_SYSTEM_CONFIG_PATH":f"{prefix}/config",
+        "SPACK_USER_CONFIG_PATH":  f"{prefix}/config/user",
+        "SPACK_SYSTEM_CONFIG_PATH":f"{prefix}/config/system",
         "SPACK_USER_CACHE_PATH":   f"{prefix}/cache",
     }
     for name, value in envvars.items():
@@ -195,23 +215,51 @@ if __name__ == "__main__":
     # - set the spack store path (where spack will install packages)
     #
     env_path = prefix / "env"
-    echo(f"mkdir {env_path}")
-    os.makedirs(env_path)
 
-    variants = {
-        "zen2":  ["+mpi"],
-        "zen3":  ["+mpi"],
-        "a100":  ["+mpi", "+cuda", "cuda_arch=80"],
-        "gh200": ["+mpi", "+cuda", "cuda_arch=90"],
-    }
-    spack_yaml_template = template_env.get_template("spack.yaml")
-    with (env_path / "spack.yaml").open(mode="w") as f:
-        f.write(
-            spack_yaml_template.render(
-                variants=variants[args.uarch],
-                prefix=prefix,
+    if args.recipe is not None:
+        recipe_path = pathlib.Path(args.recipe)
+        if not os.path.exists(recipe_path):
+            error(f"the recipe path '{str(recipe_path)}' does not exist")
+        echo(f"cp -Rv {recipe_path}{env_path}")
+        shutil.copytree(recipe_path, env_path)
+    else:
+        echo(f"mkdir {env_path}")
+        os.makedirs(env_path)
+
+        # create the stub repository
+        env_repo_path = env_path / "repo"
+        echo(f"mkdir {env_repo_path}")
+        os.makedirs(env_repo_path)
+        with (env_repo_path / "repo.yaml").open(mode="w") as f:
+            f.write(f"""repo:
+  namespace: user
+""");
+
+        os.makedirs(env_repo_path / "packages")
+        with (user_config_path / "repos.yaml").open(mode="w") as f:
+            f.write(f"""repos:
+- {env_repo_path}
+""");
+
+        variants = {
+            "zen2":  ["+mpi"],
+            "zen3":  ["+mpi"],
+            "a100":  ["+mpi", "+cuda", "cuda_arch=80"],
+            "gh200": ["+mpi", "+cuda", "cuda_arch=90"],
+        }
+
+        specs = ""
+        if args.specs is not None:
+            specs = args.specs
+        spack_yaml_template = template_env.get_template("spack.yaml")
+        with (env_path / "spack.yaml").open(mode="w") as f:
+            f.write(
+                spack_yaml_template.render(
+                    variants=variants[args.uarch],
+                    prefix=prefix,
+                    specs=specs
+                )
             )
-        )
 
     quick_subproc(["spack", "config", "--scope=user", "add", f"config:install_tree:root:{prefix}/store"])
 
@@ -234,6 +282,15 @@ if __name__ == "__main__":
     # make the build script executable
     st = os.stat(build_script)
     os.chmod(build_script, st.st_mode | stat.S_IEXEC)
+
+    metadata = {
+            "fingerprint": fp,
+            "mount": str(mount_path),
+            "uarch": args.uarch
+    }
+
+    with (config_path / "meta.json").open(mode="w") as f:
+        json.dump(metadata, f, ensure_ascii=True, indent=5)
 
     print("\n========= configuration finished =========\n")
     print("Next steps:\n")

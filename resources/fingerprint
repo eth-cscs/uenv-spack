@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# prints the fingerprint of /user-environment/meta if it has been mounted.
+
+red ()    { echo "\e[1;31m$1\e[m"; }
+yellow () { echo "\e[1;33m$1\e[m"; }
+
+datetime () { date +"%Y-%m-%d %H:%M:%S"; }
+err () { printf "$(red "[error $(datetime)]") $1\n"; exit 1; }
+
+set -e
+
+meta_path="$1"
+
+[[ ! -d /user-environment/meta ]] && err "no meta data in /user-environment"
+
+temp_path=$(mktemp -d /tmp/fp-XXXXXX)
+
+SOURCE_DATE_EPOCH='2024-01-21 00:00Z'
+tar --sort=name \
+    --mtime="${SOURCE_DATE_EPOCH}" \
+    --owner=0 --group=0 --numeric-owner \
+    --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+    -cf $temp_path/meta.tar $meta_path >& /dev/null
+
+sha256sum $temp_path/meta.tar | awk '{printf("%s", $1)}'
+
+rm -rf $temp_path

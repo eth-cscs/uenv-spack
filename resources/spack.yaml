@@ -5,7 +5,7 @@ spack:
   concretizer:
     unify: true
     reuse: true
-  specs: []
+  specs: [{{ specs }}]
   packages:
     all:
       compiler: ['gcc']
