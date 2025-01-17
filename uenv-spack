@@ -210,11 +210,12 @@ if __name__ == "__main__":
         os.environ[name] = value
 
     #
-    # create the spack env path and populate it iwth the
+    # create the spack env path
     # - populate it with the tempate spack.yaml file
     # - set the spack store path (where spack will install packages)
     #
     env_path = prefix / "env"
+    env_repo_path = env_path / "repo"
 
     if args.recipe is not None:
         recipe_path = pathlib.Path(args.recipe)
@@ -227,7 +228,6 @@ if __name__ == "__main__":
         os.makedirs(env_path)
 
         # create the stub repository
-        env_repo_path = env_path / "repo"
         echo(f"mkdir {env_repo_path}")
         os.makedirs(env_repo_path)
         with (env_repo_path / "repo.yaml").open(mode="w") as f:
@@ -236,10 +236,6 @@ if __name__ == "__main__":
 """);
 
         os.makedirs(env_repo_path / "packages")
-        with (user_config_path / "repos.yaml").open(mode="w") as f:
-            f.write(f"""repos:
-- {env_repo_path}
-""");
 
         variants = {
             "zen2":  ["+mpi"],
@@ -260,6 +256,11 @@ if __name__ == "__main__":
                     specs=specs
                 )
             )
+
+    with (user_config_path / "repos.yaml").open(mode="w") as f:
+        f.write(f"""repos:
+- {env_repo_path}
+""");
 
     quick_subproc(["spack", "config", "--scope=user", "add", f"config:install_tree:root:{prefix}/store"])
 
@@ -288,6 +289,12 @@ if __name__ == "__main__":
             "mount": str(mount_path),
             "uarch": args.uarch
     }
+
+    # copy the clean script
+    clean_script = prefix / "clean"
+    shutil.copyfile(tool_prefix / "resources/clean", clean_script)
+    st = os.stat(clean_script)
+    os.chmod(clean_script, st.st_mode | stat.S_IEXEC)
 
     with (config_path / "meta.json").open(mode="w") as f:
         json.dump(metadata, f, ensure_ascii=True, indent=5)

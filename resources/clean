@@ -1,0 +1,5 @@
+rm -rf ./store
+mkdir store
+rm -rf ./env/.spack-env
+rm -rf ./env/spack.lock
+rm -rf ./env/Makefile
