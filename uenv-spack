@@ -71,7 +71,7 @@ def get_spack_uenv():
     # there was a bug in stackinator that prepended a 'b' character to the
     # start of commit hashes - check for such hashes and fix the hash.
     if len(cmt)==41 and cmt[0]=='b':
-        release["commit"] = cmt[1:]
+        result["commit"] = cmt[1:]
     else:
         result["commit"] = cmt
 
