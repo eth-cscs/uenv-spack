@@ -1,4 +1,11 @@
-#!/usr/bin/python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "jinja2",
+#   "pyYAML",
+# ]
+# ///
 
 import pathlib
 import sys
@@ -47,6 +54,28 @@ def get_arg_parser():
 
     return parser
 
+def get_spack_repo_details(root):
+    result = {}
+
+    cmt = os.getenv(f"{root}_COMMIT")
+    if cmt is None:
+        return None
+
+    # there was a bug in stackinator that prepended a 'b' character to the
+    # start of commit hashes - check for such hashes and fix the hash.
+    if len(cmt)==41 and cmt[0]=='b':
+        result["commit"] = cmt[1:]
+    else:
+        result["commit"] = cmt
+
+    result["url"] = os.getenv(f"{root}_URL")
+    if result["url"] is None:
+        return None
+
+    result["ref"] = os.getenv(f"{root}_REF")
+
+    return result
+
 def get_spack_uenv():
     """return the spack configuration if running inside a uenv with --view=spack
 
@@ -64,22 +93,13 @@ def get_spack_uenv():
     if result["config-path"] is None:
         return None
 
-    cmt = os.getenv("UENV_SPACK_COMMIT")
-    if cmt is None:
-        return None
+    result["spack"] = get_spack_repo_details("UENV_SPACK")
+    if result["spack"] is None:
+        return None;
 
-    # there was a bug in stackinator that prepended a 'b' character to the
-    # start of commit hashes - check for such hashes and fix the hash.
-    if len(cmt)==41 and cmt[0]=='b':
-        result["commit"] = cmt[1:]
-    else:
-        result["commit"] = cmt
+    result["packages"] = get_spack_repo_details("UENV_SPACK_PACKAGES")
 
-    result["url"] = os.getenv("UENV_SPACK_URL")
-    if result["url"] is None:
-        return None
-
-    result["ref"] = os.getenv("UENV_SPACK_REF")
+    result["version"] = 1 if (result["packages"] is None) else 2
 
     return result
 
@@ -102,17 +122,21 @@ def fingerprint(path):
     exe = tool_prefix / "resources/fingerprint"
     return quick_subproc([str(exe), str(path)])
 
-def setup_spack(prefix, config):
+def clone_repo(prefix, config):
+    commit = config["ref"] if config["ref"] else config ["commit"]
+    quick_subproc(["git", "clone", "--filter=tree:0", config["url"], prefix])
+    quick_subproc(["git", "-C", prefix, "fetch", "origin", config["commit"]])
+    quick_subproc(["git", "-C", prefix, "checkout", commit],)
+
+def setup_spack(prefix, spack_config, pacakges_config):
     """clone and switch to the correct branch/commit of spack, in the location prefix/spack"""
 
     spack_path = str(prefix / "spack")
-    quick_subproc(["git", "clone", "--filter=tree:0", config["url"], spack_path])
-    quick_subproc(["git", "-C", spack_path, "fetch", "origin", config["commit"]])
-    if config["ref"] is None:
-        commit = config["commit"]
-    else:
-        commit = config["ref"]
-    quick_subproc(["git", "-C", spack_path, "checkout", commit],)
+    clone_repo(str(prefix / "spack"), spack_config)
+    # TODO: remove because we can use the version inside the uenv at
+    # {{mount}}/repos/spack_repo/builtin
+    #if packages_config is not None:
+    #    clone_repo(str(prefix / "spack-packages"), packages_config)
 
 if __name__ == "__main__":
     # create the jinja2 template engine up front
@@ -134,17 +158,33 @@ if __name__ == "__main__":
     #
     # parse the environment variables set by --view=spack
     #
-    spack_config = get_spack_uenv()
-    if spack_config is None:
+    full_config = get_spack_uenv()
+    if full_config is None:
         error("run in a uenv with spack configured")
 
+    spack_config = full_config["spack"]
+    packages_config = full_config["packages"]
+    new_recipe: bool = full_config["version"] > 1
+
     print(f"============== spack configuration ==============")
-    print(f"spack config: {spack_config['config-path']}")
+    print(f"spack config: {full_config['config-path']}")
+    print()
     print(f"spack url:    {spack_config['url']}")
     print(f"spack commit: {spack_config['commit']}")
     if spack_config["ref"] is not None:
         print(f"spack ref:    {spack_config['ref']}")
+
+    if packages_config is not None:
+        print("")
+        print(f"packages url:    {packages_config['url']}")
+        print(f"packages commit: {packages_config['commit']}")
+        if packages_config["ref"] is not None:
+            print(f"packages ref:    {packages_config['ref']}")
+
+    print()
+    print(f"uenv recipe version: {full_config['version']}")
     print(f"=================================================")
+
     #
     # create the working path for the user installation
     #
@@ -154,7 +194,7 @@ if __name__ == "__main__":
             error(f"the path {prefix} already exists")
         shutil.rmtree(prefix)
 
-    mount_path = pathlib.Path(os.path.realpath(spack_config["config-path"] + "/..")).resolve()
+    mount_path = pathlib.Path(os.path.realpath(full_config["config-path"] + "/..")).resolve()
     meta_path = mount_path / "meta"
 
     print(f"prefix path: {prefix}")
@@ -172,7 +212,7 @@ if __name__ == "__main__":
     print(f"fingerprint = {fp}")
 
     print(f"================= spack init ====================")
-    setup_spack(prefix, spack_config)
+    setup_spack(prefix, spack_config, packages_config)
 
     #
     # create a spack config path
@@ -183,7 +223,7 @@ if __name__ == "__main__":
     config_path = prefix / "config"
     system_config_path = config_path / "system"
     try:
-        shutil.copytree(spack_config["config-path"], system_config_path)
+        shutil.copytree(full_config["config-path"], system_config_path)
     except OSError as err:
         error(f"unable to create spack config path {system_config_path}: {err}")
 

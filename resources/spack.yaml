@@ -8,6 +8,9 @@ spack:
   specs: [{{ specs }}]
   packages:
     all:
+      # TODO: the compiler field needs to go
+      # TODO: we need to set up the compiler from the uenv
+      # do this by hand editing a generated spack.yaml: maybe explicitly add the compiler specs to specs above (or add them to a packages.yaml file)
       compiler: ['gcc']
       variants: [{% for v in variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
     mpi:
