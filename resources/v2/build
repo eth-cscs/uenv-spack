@@ -48,6 +48,9 @@ echo "actual_fp   $actual_fp"
 echo "mount       $mount"
 [[ "$expected_fp" != "$actual_fp" ]] && err "the wrong uenv has been mounted"
 
+echo === bootstrap =========================================
+spack bootstrap now
+
 echo === concretizing ======================================
 spack -e $env concretize -f
 

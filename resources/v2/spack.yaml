@@ -1,16 +1,16 @@
 {% set listjoiner = joiner(',') %}
 spack:
   include:
-    - {{ prefix }}/config/user
-    - {{ prefix }}/config/system
+    - {{ config.prefix }}/config/user
+    - {{ config.prefix }}/config/system
   config:
     deprecated: false
   concretizer:
     unify: true
     reuse: true
   specs:
-    {% if specs %}
-    {% for spec in specs %}  - {{ spec }}
+    {% if config.specs %}
+    {% for spec in config.specs %}  - {{ spec }}
     {% endfor %}
     {% else %}  - # add specs here
     {% endif %}
@@ -18,9 +18,9 @@ spack:
     all:
     {% if prefer %}
 {% set separator = joiner(', ') %}
-      prefer: [{% for c in prefer %}{{ separator() }}'{{ c }}'{% endfor %}]
+      prefer: [{% for c in config.prefer %}{{ separator() }}'{{ c }}'{% endfor %}]
     {% endif %}
-      variants: [{% for v in variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
+      variants: [{% for v in config.variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
     mpi:
       require: 'cray-mpich'
   view:
@@ -28,5 +28,5 @@ spack:
     default:
       # one of (run, roots, all)
       link: run
-      root: {{ prefix }}/view
+      root: {{ config.prefix }}/view
 

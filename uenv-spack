@@ -27,6 +27,13 @@ import yaml
 # list of known compiler toolchains supported by stackinator/uenv
 known_compilers: list[str] = ["gcc", "nvhpc", "llvm", "llvm-amdgpu"]
 
+global_variants = {
+    "zen2":  ["+mpi"],
+    "zen3":  ["+mpi"],
+    "a100":  ["+mpi", "+cuda", "cuda_arch=80"],
+    "gh200": ["+mpi", "+cuda", "cuda_arch=90"],
+}
+
 #
 # globals
 #
@@ -137,8 +144,10 @@ def get_spack_uenv():
 
     return result
 
-def quick_subproc(args):
-    echo(' '.join(args))
+def quick_subproc(args: list[str], quiet: bool=False):
+    # print the command being executed to stdout
+    if not quiet:
+        echo(' '.join(args))
 
     capture = subprocess.run(
         args,
@@ -154,7 +163,7 @@ def quick_subproc(args):
 
 def fingerprint(path):
     exe = resources_path() / "fingerprint"
-    return quick_subproc([str(exe), str(path)])
+    return quick_subproc([str(exe), str(path)], quiet=True)
 
 def clone_repo(prefix, config):
     commit = config["ref"] if config["ref"] else config ["commit"]
@@ -170,16 +179,25 @@ def setup_spack(prefix, spack_config):
 
 # read a packages.yaml file and extract compiler list
 # this could be modified to list 
-def read_compiler_config(config_path):
-    packages_file = config_path + "/packages.yaml"
+def read_compiler_config(config_path, recipe_version: int):
     compilers = {}
-    with open(packages_file, "r") as fid:
-        raw = yaml.load(fid, Loader=yaml.Loader)
-        for c in known_compilers:
-            if (c in raw["packages"]) and ("externals" in raw["packages"][c]):
-                spec = raw["packages"][c]["externals"][0]["spec"]
-                # split off the name@version, e.g. gcc@14.2.0
-                compilers[c] = spec.split()[0]
+    if recipe_version == 1:
+        packages_file = config_path + "/compilers.yaml"
+        with open(packages_file, "r") as fid:
+            raw = yaml.load(fid, Loader=yaml.Loader)
+            for c in raw['compilers']:
+                spec = c['compiler']['spec']
+                compiler = spec.split('@')[0]
+                compilers[compiler] = spec
+    else:
+        packages_file = config_path + "/packages.yaml"
+        with open(packages_file, "r") as fid:
+            raw = yaml.load(fid, Loader=yaml.Loader)
+            for c in known_compilers:
+                if (c in raw["packages"]) and ("externals" in raw["packages"][c]):
+                    spec = raw["packages"][c]["externals"][0]["spec"]
+                    # split off the name@version, e.g. gcc@14.2.0
+                    compilers[c] = spec.split()[0]
     return compilers
 
 if __name__ == "__main__":
@@ -207,28 +225,29 @@ if __name__ == "__main__":
     recipe_version = config["version"]
 
     # get the list of compilers
-    config["compilers"] = read_compiler_config(config["config-path"])
+    config["compilers"] = read_compiler_config(config["config-path"], recipe_version)
     if args.compiler not in config["compilers"]:
         error(f"the requested compiler '{args.compiler}' is not one of {list(config['compilers'].keys())}")
-    config["compiler"] = args.compiler
+    config["compiler"] = config['compilers'][args.compiler]
 
-    # set up spack package preferences
-    # these are currently used to set the compiler preferences
-    prefer = []
+    if recipe_version==2:
+        # set up spack package preferences
+        # these are currently used to set the compiler preferences
+        prefer = []
 
-    # known_compilers is in order of precidence (gcc first)
-    # hence, look for the first match and use it
-    # TODO: add a flag that lets the user select gcc, llvm, etc, and use
-    #       that choice if it is available.
-    for c in known_compilers:
-        if c in config["compilers"]:
-            spec = config["compilers"][c]
-            prefer.append(f"%[when=%c] c={spec}")
-            prefer.append(f"%[when=%cxx] cxx={spec}")
-            prefer.append(f"%[when=%fortran] fortran={spec}")
-            break
+        # known_compilers is in order of precidence (gcc first)
+        # hence, look for the first match and use it
+        # TODO: add a flag that lets the user select gcc, llvm, etc, and use
+        #       that choice if it is available.
+        for c in known_compilers:
+            if c in config["compilers"]:
+                spec = config["compilers"][c]
+                prefer.append(f"%[when=%c] c={spec}")
+                prefer.append(f"%[when=%cxx] cxx={spec}")
+                prefer.append(f"%[when=%fortran] fortran={spec}")
+                break
 
-    config["prefer"] = prefer
+        config["prefer"] = prefer
 
     # get the list of specs if the user provided any
     specs = []
@@ -240,6 +259,8 @@ if __name__ == "__main__":
     prefix = pathlib.Path(os.path.abspath(args.prefix))
     mount_path = pathlib.Path(os.path.realpath(config["config-path"] + "/..")).resolve()
     meta_path = mount_path / "meta"
+
+    config["prefix"] = prefix
 
     # create a fingerprint
     fp = fingerprint(meta_path) if os.path.exists(meta_path) else None
@@ -266,7 +287,7 @@ if __name__ == "__main__":
     print(f"meta   path: {meta_path}")
     print()
     print(f"specs:    {config['specs']}")
-    print(f"compiler: {config['compilers'][config['compiler']]}")
+    print(f"compiler: {config['compiler']}")
     print()
     print(green("==========================================="))
     print(green("================ steps ===================="))
@@ -315,7 +336,7 @@ if __name__ == "__main__":
     # copy the modules.yaml file
     modules_template = template_env.get_template("modules.yaml")
     with (user_config_path / "modules.yaml").open(mode="w") as f:
-        f.write(modules_template.render(prefix=prefix))
+        f.write(modules_template.render(prefix=config["prefix"]))
 
     #
     # set SPACK environment variables
@@ -338,18 +359,20 @@ if __name__ == "__main__":
     env_path = prefix / "env"
     env_repo_path = env_path / "repo"
 
-    # populate it with the tempate spack.yaml or input recipe
+    # if a recipe was provided, copy it into the $prefix/env path
     if args.recipe is not None:
         recipe_path = pathlib.Path(args.recipe)
         if not os.path.exists(recipe_path):
             error(f"the recipe path '{str(recipe_path)}' does not exist")
         echo(f"cp -Rv {recipe_path}{env_path}")
         shutil.copytree(recipe_path, env_path)
+    # else create the env path and populate it with a stub spack.yaml
+    # and empty package repo.
     else:
         echo(f"mkdir {env_path}")
         os.makedirs(env_path)
 
-        # create the stub repository
+        # create the stub package repo
         echo(f"mkdir {env_repo_path}")
         os.makedirs(env_repo_path)
         with (env_repo_path / "repo.yaml").open(mode="w") as f:
@@ -359,22 +382,12 @@ if __name__ == "__main__":
 
         os.makedirs(env_repo_path / "packages")
 
-        variants = {
-            "zen2":  ["+mpi"],
-            "zen3":  ["+mpi"],
-            "a100":  ["+mpi", "+cuda", "cuda_arch=80"],
-            "gh200": ["+mpi", "+cuda", "cuda_arch=90"],
-        }
+        config['variants'] = global_variants[args.uarch]
 
         spack_yaml_template = template_env.get_template("spack.yaml")
         with (env_path / "spack.yaml").open(mode="w") as f:
             f.write(
-                spack_yaml_template.render(
-                    variants=variants[args.uarch],
-                    prefix=prefix,
-                    specs=config["specs"],
-                    prefer=config["prefer"],
-                )
+                spack_yaml_template.render(config = config)
             )
 
     with (user_config_path / "repos.yaml").open(mode="w") as f:
@@ -383,7 +396,6 @@ if __name__ == "__main__":
 """);
 
     # set the spack store path (where spack will install packages)
-    #quick_subproc(["spack", "config", "--scope=user", "add", f"config:install_tree:root:{prefix}/store"])
     with (user_config_path / "config.yaml").open(mode="w") as f:
         f.write(f"""config:
   install_tree:
