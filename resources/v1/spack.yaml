@@ -5,13 +5,18 @@ spack:
   concretizer:
     unify: true
     reuse: true
-  specs: [{{ specs }}]
+  specs:
+    {% if specs %}
+    {% for spec in specs %}  - {{ spec }}
+    {% endfor %}
+    {% else %}  - # add specs here
+    {% endif %}
   packages:
     all:
-      # TODO: the compiler field needs to go
-      # TODO: we need to set up the compiler from the uenv
-      # do this by hand editing a generated spack.yaml: maybe explicitly add the compiler specs to specs above (or add them to a packages.yaml file)
-      compiler: ['gcc']
+    {% if prefer %}
+{% set separator = joiner(', ') %}
+      prefer: [{% for c in prefer %}{{ separator() }}'{{ c }}'{% endfor %}]
+    {% endif %}
       variants: [{% for v in variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
     mpi:
       require: 'cray-mpich'

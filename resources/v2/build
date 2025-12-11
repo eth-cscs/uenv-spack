@@ -1,0 +1,66 @@
+#!/bin/bash
+
+set -e
+
+red ()    { echo "\e[1;31m$1\e[m"; }
+yellow () { echo "\e[1;33m$1\e[m"; }
+
+datetime () { date +"%Y-%m-%d %H:%M:%S"; }
+err () { printf "$(red "[error $(datetime)]") $1\n"; exit 1; }
+
+fingerprint() {
+    meta_path="$1"
+
+    [[ ! -d /user-environment/meta ]] && err "no meta data in /user-environment"
+
+    temp_path=$(mktemp -d /tmp/fp-XXXXXX)
+
+    SOURCE_DATE_EPOCH='2024-01-21 00:00Z'
+    tar --sort=name \
+        --mtime="${SOURCE_DATE_EPOCH}" \
+        --owner=0 --group=0 --numeric-owner \
+        --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+        -cf $temp_path/meta.tar $meta_path >& /dev/null
+
+    fp=$(sha256sum $temp_path/meta.tar | awk '{printf("%s", $1)}')
+
+    rm -rf $temp_path
+
+    echo $fp
+}
+
+export SPACK_COLOR=always
+
+{% for name, value in envvars.items() %}
+export {{ name }}='{{ value }}'
+{% endfor %}
+
+export prefix={{ prefix }}
+export env={{ env_path }}
+cd $prefix
+
+echo === checking fingerprint ==============================
+mount=$(jq -r .mount $prefix/config/meta.json)
+expected_fp=$(jq -r .fingerprint $prefix/config/meta.json)
+actual_fp=$(fingerprint $mount/meta)
+echo "expected_fp $expected_fp"
+echo "actual_fp   $actual_fp"
+echo "mount       $mount"
+[[ "$expected_fp" != "$actual_fp" ]] && err "the wrong uenv has been mounted"
+
+echo === concretizing ======================================
+spack -e $env concretize -f
+
+echo === generating Makefile ===============================
+spack -e $env env depfile -o $env/Makefile
+
+echo === building ==========================================
+make -j32 -f $env/Makefile --output-sync=recurse
+
+echo == generating modules =================================
+# use the variant with --upstream-modules to generate comprehensive modules
+spack module tcl refresh --upstream-modules --delete-tree --yes-to-all
+
+echo == generating view =====================================
+spack env activate --with-view default --sh $env > activate.sh
+
