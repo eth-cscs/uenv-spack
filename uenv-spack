@@ -15,6 +15,7 @@ import argparse
 import jinja2
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -87,6 +88,7 @@ def get_arg_parser():
     parser.add_argument("prefix", help="the path in which to set up the installation", type=str)
     parser.add_argument("--overwrite", action="store_true", help="delete the prefix path if it exists")
     parser.add_argument("--uarch", help="one of [zen2, zen3, gh200, a100]", type=str, required=True)
+    parser.add_argument("--name", help="a name for the environment (alphanumeric, - and _ only)", type=str, required=True)
     recipe_group = parser.add_mutually_exclusive_group()
     recipe_group.add_argument("--recipe", help="a spack.yaml file or env path", type=str, required=False)
     recipe_group.add_argument("--specs", help="a comma separated list of specs, e.g. 'fftw, arbor ~cuda'", type=str, required=False)
@@ -209,6 +211,8 @@ if __name__ == "__main__":
     available_uarch = ["zen2", "zen3", "gh200", "a100"]
     if args.uarch not in available_uarch:
         error(f"--uarch={args.uarch} is not one of [{', '.join(available_uarch)}]")
+    if not re.compile(r'^[A-Za-z][A-Za-z0-9_-]*$').fullmatch(args.name):
+        error(f"--name={args.name} does not start with a letter and contain only alphanumeric, _ and - characters")
 
     #
     # extract and find configuration information
@@ -219,8 +223,6 @@ if __name__ == "__main__":
     if config is None:
         error("run in a uenv with spack configured")
 
-    config["spack"]
-
     # set the recipe_version global variable
     recipe_version = config["version"]
 
@@ -229,6 +231,10 @@ if __name__ == "__main__":
     if args.compiler not in config["compilers"]:
         error(f"the requested compiler '{args.compiler}' is not one of {list(config['compilers'].keys())}")
     config["compiler"] = config['compilers'][args.compiler]
+
+    # set config variables from args
+    config["name"] = args.name
+    config["uarch"] = args.uarch
 
     if recipe_version==2:
         # set up spack package preferences
@@ -260,7 +266,24 @@ if __name__ == "__main__":
     mount_path = pathlib.Path(os.path.realpath(config["config-path"] + "/..")).resolve()
     meta_path = mount_path / "meta"
 
-    config["prefix"] = prefix
+    config["paths"] = {
+        "prefix": prefix,
+        "store": prefix / "store",
+        "modules": prefix / "store/modules",
+        "view": prefix / f"store/env/{config['name']}",
+        "spackenv": prefix / "env",
+    }
+
+    envvars = {
+        "PATH":                    f"{prefix}/spack/bin:$PATH",
+        "SPACK_USER_CACHE_PATH":   f"{prefix}/cache",
+    }
+    if recipe_version==1:
+        envvars["SPACK_USER_CONFIG_PATH"]   = f"{prefix}/config/user"
+        envvars["SPACK_SYSTEM_CONFIG_PATH"] = f"{prefix}/config/system"
+
+    config["envvars"] = envvars
+
 
     # create a fingerprint
     fp = fingerprint(meta_path) if os.path.exists(meta_path) else None
@@ -288,6 +311,8 @@ if __name__ == "__main__":
     print()
     print(f"specs:    {config['specs']}")
     print(f"compiler: {config['compiler']}")
+    print(f"uarch:    {config['uarch']}")
+    print(f"name:     {config['name']}")
     print()
     print(green("==========================================="))
     print(green("================ steps ===================="))
@@ -336,27 +361,19 @@ if __name__ == "__main__":
     # copy the modules.yaml file
     modules_template = template_env.get_template("modules.yaml")
     with (user_config_path / "modules.yaml").open(mode="w") as f:
-        f.write(modules_template.render(prefix=config["prefix"]))
+        f.write(modules_template.render(config=config))
 
     #
     # set SPACK environment variables
     #
-    envvars = {
-        "PATH":                    f"{prefix}/spack/bin:{os.getenv('PATH','')}",
-        "SPACK_USER_CACHE_PATH":   f"{prefix}/cache",
-    }
-    if recipe_version==1:
-        envvars["SPACK_USER_CONFIG_PATH"]   = f"{prefix}/config/user"
-        envvars["SPACK_SYSTEM_CONFIG_PATH"] = f"{prefix}/config/system"
-
-    for name, value in envvars.items():
+    for name, value in config["envvars"].items():
         echo(f"export {name}='{value}'")
         os.environ[name] = value
 
     #
     # create the spack env path
     #
-    env_path = prefix / "env"
+    env_path = config["paths"]["spackenv"]
     env_repo_path = env_path / "repo"
 
     # if a recipe was provided, copy it into the $prefix/env path
@@ -386,9 +403,7 @@ if __name__ == "__main__":
 
         spack_yaml_template = template_env.get_template("spack.yaml")
         with (env_path / "spack.yaml").open(mode="w") as f:
-            f.write(
-                spack_yaml_template.render(config = config)
-            )
+            f.write(spack_yaml_template.render(config=config))
 
     with (user_config_path / "repos.yaml").open(mode="w") as f:
         f.write(f"""repos:
@@ -399,7 +414,7 @@ if __name__ == "__main__":
     with (user_config_path / "config.yaml").open(mode="w") as f:
         f.write(f"""config:
   install_tree:
-    root: {prefix}/store
+    root: {config['paths']['store']}
 """);
 
     #
@@ -410,13 +425,7 @@ if __name__ == "__main__":
     build_script = prefix / "build"
     build_template = template_env.get_template("build")
     with (build_script).open(mode="w") as f:
-        f.write(
-            build_template.render(
-                prefix=prefix,
-                env_path=env_path,
-                envvars=envvars,
-            )
-        )
+        f.write(build_template.render(config=config))
 
     # make the build script executable
     st = os.stat(build_script)

@@ -12,7 +12,7 @@ modules:
     arch_folder: false
     # Where to install modules
     roots:
-      tcl: {{ prefix }}/modules
+      tcl: {{ config.paths.modules }}
     tcl:
       all:
         autoload: none

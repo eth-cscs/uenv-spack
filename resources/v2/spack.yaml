@@ -1,8 +1,8 @@
 {% set listjoiner = joiner(',') %}
 spack:
   include:
-    - {{ config.prefix }}/config/user
-    - {{ config.prefix }}/config/system
+    - {{ config.paths.prefix }}/config/user
+    - {{ config.paths.prefix }}/config/system
   config:
     deprecated: false
   concretizer:
@@ -28,5 +28,5 @@ spack:
     default:
       # one of (run, roots, all)
       link: run
-      root: {{ config.prefix }}/view
+      root: {{ config.paths.view }}
 
