@@ -1,0 +1,32 @@
+{% set listjoiner = joiner(',') %}
+spack:
+  include:
+    - {{ config.paths.prefix }}/config/user
+    - {{ config.paths.prefix }}/config/system
+  config:
+    deprecated: false
+  concretizer:
+    unify: true
+    reuse: true
+  specs:
+    {% if config.specs %}
+    {% for spec in config.specs %}  - {{ spec }}
+    {% endfor %}
+    {% else %}  - # add specs here
+    {% endif %}
+  packages:
+    all:
+    {% if prefer %}
+{% set separator = joiner(', ') %}
+      prefer: [{% for c in config.prefer %}{{ separator() }}'{{ c }}'{% endfor %}]
+    {% endif %}
+      variants: [{% for v in config.variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
+    mpi:
+      require: 'cray-mpich'
+  view:
+    # https://spack.readthedocs.io/en/latest/environments.html#advanced-view-configuration
+    default:
+      # one of (run, roots, all)
+      link: run
+      root: {{ config.paths.view }}
+

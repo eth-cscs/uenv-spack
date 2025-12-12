@@ -1,20 +1,49 @@
-#!/usr/bin/python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "jinja2",
+#   "pyYAML",
+# ]
+# ///
 
 import pathlib
 import sys
 
-tool_prefix = pathlib.Path(__file__).parent.resolve()
-external = tool_prefix / 'external'
-sys.path = [tool_prefix.as_posix(), external.as_posix()] + sys.path
-
+# add t
 import argparse
 import jinja2
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import yaml
+
+#
+# constants
+#
+
+# list of known compiler toolchains supported by stackinator/uenv
+known_compilers: list[str] = ["gcc", "nvhpc", "llvm", "llvm-amdgpu"]
+
+global_variants = {
+    "zen2":  ["+mpi"],
+    "zen3":  ["+mpi"],
+    "a100":  ["+mpi", "+cuda", "cuda_arch=80"],
+    "gh200": ["+mpi", "+cuda", "cuda_arch=90"],
+}
+
+#
+# globals
+#
+
+recipe_version: int = -1
+
+#
+# utility helpers
+#
 
 def red(msg):
     return f"\033[31m{msg}\033[0m"
@@ -35,17 +64,60 @@ def error(msg):
     print(f"{red('[error]')} {msg}")
     exit(1)
 
+# the prefix path where this tool was installed (usually the location where it
+# was git cloned to)
+def tool_prefix():
+    return pathlib.Path(__file__).parent.resolve()
+
+# the path with the resources (templates, helpers, etc) needed to build the
+# environment. Versioned according to the recipe version
+# version 1: recipes pre  spack 1.0 (Stackinator 5)
+# version 2: recipes post spack 1.0 (Stackinator 6)
+def resources_path():
+    if recipe_version < 1 or recipe_version > 2:
+        error("invalid recipe version {recipe_version}")
+    return tool_prefix() / f"resources/v{recipe_version}"
+
+#
+# CLI argument parsing
+#
+
 def get_arg_parser():
     """generate and return the command line argument parser"""
     parser = argparse.ArgumentParser()
     parser.add_argument("prefix", help="the path in which to set up the installation", type=str)
     parser.add_argument("--overwrite", action="store_true", help="delete the prefix path if it exists")
     parser.add_argument("--uarch", help="one of [zen2, zen3, gh200, a100]", type=str, required=True)
+    parser.add_argument("--name", help="a name for the environment (alphanumeric, - and _ only)", type=str, required=True)
     recipe_group = parser.add_mutually_exclusive_group()
     recipe_group.add_argument("--recipe", help="a spack.yaml file or env path", type=str, required=False)
     recipe_group.add_argument("--specs", help="a comma separated list of specs, e.g. 'fftw, arbor ~cuda'", type=str, required=False)
+    # recipe v2 options
+    parser.add_argument("--compiler", help="one of [gcc, nvhpc, llvm-amdgpu]", type=str, default="gcc", required=False)
 
     return parser
+
+def get_spack_repo_details(root):
+    result = {}
+
+    cmt = os.getenv(f"{root}_COMMIT")
+    if cmt is None:
+        return None
+
+    # there was a bug in stackinator that prepended a 'b' character to the
+    # start of commit hashes - check for such hashes and fix the hash.
+    if len(cmt)==41 and cmt[0]=='b':
+        result["commit"] = cmt[1:]
+    else:
+        result["commit"] = cmt
+
+    result["url"] = os.getenv(f"{root}_URL")
+    if result["url"] is None:
+        return None
+
+    result["ref"] = os.getenv(f"{root}_REF")
+
+    return result
 
 def get_spack_uenv():
     """return the spack configuration if running inside a uenv with --view=spack
@@ -64,27 +136,20 @@ def get_spack_uenv():
     if result["config-path"] is None:
         return None
 
-    cmt = os.getenv("UENV_SPACK_COMMIT")
-    if cmt is None:
-        return None
+    result["spack"] = get_spack_repo_details("UENV_SPACK")
+    if result["spack"] is None:
+        return None;
 
-    # there was a bug in stackinator that prepended a 'b' character to the
-    # start of commit hashes - check for such hashes and fix the hash.
-    if len(cmt)==41 and cmt[0]=='b':
-        result["commit"] = cmt[1:]
-    else:
-        result["commit"] = cmt
+    result["packages"] = get_spack_repo_details("UENV_SPACK_PACKAGES")
 
-    result["url"] = os.getenv("UENV_SPACK_URL")
-    if result["url"] is None:
-        return None
-
-    result["ref"] = os.getenv("UENV_SPACK_REF")
+    result["version"] = 1 if (result["packages"] is None) else 2
 
     return result
 
-def quick_subproc(args):
-    echo(' '.join(args))
+def quick_subproc(args: list[str], quiet: bool=False):
+    # print the command being executed to stdout
+    if not quiet:
+        echo(' '.join(args))
 
     capture = subprocess.run(
         args,
@@ -99,29 +164,45 @@ def quick_subproc(args):
     return capture.stdout.decode("utf-8")
 
 def fingerprint(path):
-    exe = tool_prefix / "resources/fingerprint"
-    return quick_subproc([str(exe), str(path)])
+    exe = resources_path() / "fingerprint"
+    return quick_subproc([str(exe), str(path)], quiet=True)
 
-def setup_spack(prefix, config):
+def clone_repo(prefix, config):
+    commit = config["ref"] if config["ref"] else config ["commit"]
+    quick_subproc(["git", "clone", "--filter=tree:0", config["url"], prefix])
+    quick_subproc(["git", "-C", prefix, "fetch", "origin", config["commit"]])
+    quick_subproc(["git", "-C", prefix, "checkout", commit],)
+
+def setup_spack(prefix, spack_config):
     """clone and switch to the correct branch/commit of spack, in the location prefix/spack"""
 
     spack_path = str(prefix / "spack")
-    quick_subproc(["git", "clone", "--filter=tree:0", config["url"], spack_path])
-    quick_subproc(["git", "-C", spack_path, "fetch", "origin", config["commit"]])
-    if config["ref"] is None:
-        commit = config["commit"]
+    clone_repo(str(prefix / "spack"), spack_config)
+
+# read a packages.yaml file and extract compiler list
+# this could be modified to list 
+def read_compiler_config(config_path, recipe_version: int):
+    compilers = {}
+    if recipe_version == 1:
+        packages_file = config_path + "/compilers.yaml"
+        with open(packages_file, "r") as fid:
+            raw = yaml.load(fid, Loader=yaml.Loader)
+            for c in raw['compilers']:
+                spec = c['compiler']['spec']
+                compiler = spec.split('@')[0]
+                compilers[compiler] = spec
     else:
-        commit = config["ref"]
-    quick_subproc(["git", "-C", spack_path, "checkout", commit],)
+        packages_file = config_path + "/packages.yaml"
+        with open(packages_file, "r") as fid:
+            raw = yaml.load(fid, Loader=yaml.Loader)
+            for c in known_compilers:
+                if (c in raw["packages"]) and ("externals" in raw["packages"][c]):
+                    spec = raw["packages"][c]["externals"][0]["spec"]
+                    # split off the name@version, e.g. gcc@14.2.0
+                    compilers[c] = spec.split()[0]
+    return compilers
 
 if __name__ == "__main__":
-    # create the jinja2 template engine up front
-    template_env = jinja2.Environment(
-        loader=jinja2.FileSystemLoader(tool_prefix / "resources"),
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
-
     # parse CLI arguments
     parser = get_arg_parser()
     args = parser.parse_args()
@@ -130,49 +211,128 @@ if __name__ == "__main__":
     available_uarch = ["zen2", "zen3", "gh200", "a100"]
     if args.uarch not in available_uarch:
         error(f"--uarch={args.uarch} is not one of [{', '.join(available_uarch)}]")
+    if not re.compile(r'^[A-Za-z][A-Za-z0-9_-]*$').fullmatch(args.name):
+        error(f"--name={args.name} does not start with a letter and contain only alphanumeric, _ and - characters")
 
     #
-    # parse the environment variables set by --view=spack
+    # extract and find configuration information
     #
-    spack_config = get_spack_uenv()
-    if spack_config is None:
+
+    # parse the environment variables set by --view=spack
+    config = get_spack_uenv()
+    if config is None:
         error("run in a uenv with spack configured")
 
-    print(f"============== spack configuration ==============")
-    print(f"spack config: {spack_config['config-path']}")
-    print(f"spack url:    {spack_config['url']}")
-    print(f"spack commit: {spack_config['commit']}")
-    if spack_config["ref"] is not None:
-        print(f"spack ref:    {spack_config['ref']}")
-    print(f"=================================================")
+    # set the recipe_version global variable
+    recipe_version = config["version"]
+
+    # get the list of compilers
+    config["compilers"] = read_compiler_config(config["config-path"], recipe_version)
+    if args.compiler not in config["compilers"]:
+        error(f"the requested compiler '{args.compiler}' is not one of {list(config['compilers'].keys())}")
+    config["compiler"] = config['compilers'][args.compiler]
+
+    # set config variables from args
+    config["name"] = args.name
+    config["uarch"] = args.uarch
+
+    if recipe_version==2:
+        # set up spack package preferences
+        # these are currently used to set the compiler preferences
+        prefer = []
+
+        # known_compilers is in order of precidence (gcc first)
+        # hence, look for the first match and use it
+        # TODO: add a flag that lets the user select gcc, llvm, etc, and use
+        #       that choice if it is available.
+        for c in known_compilers:
+            if c in config["compilers"]:
+                spec = config["compilers"][c]
+                prefer.append(f"%[when=%c] c={spec}")
+                prefer.append(f"%[when=%cxx] cxx={spec}")
+                prefer.append(f"%[when=%fortran] fortran={spec}")
+                break
+
+        config["prefer"] = prefer
+
+    # get the list of specs if the user provided any
+    specs = []
+    if args.specs is not None:
+        specs = [x.strip() for x in args.specs.split(',')]
+    config["specs"] = specs
+
+    # find paths needed later
+    prefix = pathlib.Path(os.path.abspath(args.prefix))
+    mount_path = pathlib.Path(os.path.realpath(config["config-path"] + "/..")).resolve()
+    meta_path = mount_path / "meta"
+
+    config["paths"] = {
+        "prefix": prefix,
+        "store": prefix / "store",
+        "modules": prefix / "store/modules",
+        "view": prefix / f"store/env/{config['name']}",
+        "spackenv": prefix / "env",
+    }
+
+    envvars = {
+        "PATH":                    f"{prefix}/spack/bin:$PATH",
+        "SPACK_USER_CACHE_PATH":   f"{prefix}/cache",
+    }
+    if recipe_version==1:
+        envvars["SPACK_USER_CONFIG_PATH"]   = f"{prefix}/config/user"
+        envvars["SPACK_SYSTEM_CONFIG_PATH"] = f"{prefix}/config/system"
+
+    config["envvars"] = envvars
+
+
+    # create a fingerprint
+    fp = fingerprint(meta_path) if os.path.exists(meta_path) else None
+
+    #
+    # Print information about environment to set up
+    #
+    print(green("==========================================="))
+    print(green("============== configuration =============="))
+    print()
+    print(f"spack url:    {config['spack']['url']}")
+    print(f"spack commit: {config['spack']['commit']}")
+    if config['spack']["ref"] is not None:
+        print(f"spack ref:    {config['spack']['ref']}")
+    print()
+    print(f"uenv recipe version: {config['version']}")
+    print(f"uenv spack config:   {config['config-path']}")
+    print(f"uenv fingerprint:    {fp}")
+    print(f"uenv compilers:      {[v for k,v in config['compilers'].items()]}")
+    print()
+    print(f"prefix path: {prefix}")
+    print(f"tool   path: {tool_prefix()}")
+    print(f"mount  path: {mount_path}")
+    print(f"meta   path: {meta_path}")
+    print()
+    print(f"specs:    {config['specs']}")
+    print(f"compiler: {config['compiler']}")
+    print(f"uarch:    {config['uarch']}")
+    print(f"name:     {config['name']}")
+    print()
+    print(green("==========================================="))
+    print(green("================ steps ===================="))
+    print()
+
     #
     # create the working path for the user installation
     #
-    prefix = pathlib.Path(os.path.abspath(args.prefix))
     if os.path.exists(prefix):
         if not args.overwrite:
             error(f"the path {prefix} already exists")
         shutil.rmtree(prefix)
 
-    mount_path = pathlib.Path(os.path.realpath(spack_config["config-path"] + "/..")).resolve()
-    meta_path = mount_path / "meta"
-
-    print(f"prefix path: {prefix}")
-    print(f"tool   path: {tool_prefix}")
-    print(f"mount  path: {mount_path}")
-    print(f"meta   path: {meta_path}")
     try:
         echo(f"mkdir -p {prefix}")
         os.makedirs(prefix)
     except PermissionError:
         error(f"you do not have permission to create {prefix}")
 
-    # create a fingerprint
-    fp = fingerprint(meta_path) if os.path.exists(meta_path) else None
-    print(f"fingerprint = {fp}")
-
-    print(f"================= spack init ====================")
-    setup_spack(prefix, spack_config)
+    setup_spack(prefix, config['spack'])
 
     #
     # create a spack config path
@@ -183,7 +343,7 @@ if __name__ == "__main__":
     config_path = prefix / "config"
     system_config_path = config_path / "system"
     try:
-        shutil.copytree(spack_config["config-path"], system_config_path)
+        shutil.copytree(config["config-path"], system_config_path)
     except OSError as err:
         error(f"unable to create spack config path {system_config_path}: {err}")
 
@@ -191,43 +351,45 @@ if __name__ == "__main__":
     os.makedirs(user_config_path)
     echo(f"mkdir {user_config_path}")
 
+    # create the jinja2 template engine up front
+    template_env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(resources_path()),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
     # copy the modules.yaml file
     modules_template = template_env.get_template("modules.yaml")
     with (user_config_path / "modules.yaml").open(mode="w") as f:
-        f.write(modules_template.render(prefix=prefix))
+        f.write(modules_template.render(config=config))
 
     #
     # set SPACK environment variables
     #
-    envvars = {
-        "PATH":                    f"{prefix}/spack/bin:{os.getenv('PATH','')}",
-        "SPACK_USER_CONFIG_PATH":  f"{prefix}/config/user",
-        "SPACK_SYSTEM_CONFIG_PATH":f"{prefix}/config/system",
-        "SPACK_USER_CACHE_PATH":   f"{prefix}/cache",
-    }
-    for name, value in envvars.items():
+    for name, value in config["envvars"].items():
         echo(f"export {name}='{value}'")
         os.environ[name] = value
 
     #
     # create the spack env path
-    # - populate it with the tempate spack.yaml file
-    # - set the spack store path (where spack will install packages)
     #
-    env_path = prefix / "env"
+    env_path = config["paths"]["spackenv"]
     env_repo_path = env_path / "repo"
 
+    # if a recipe was provided, copy it into the $prefix/env path
     if args.recipe is not None:
         recipe_path = pathlib.Path(args.recipe)
         if not os.path.exists(recipe_path):
             error(f"the recipe path '{str(recipe_path)}' does not exist")
         echo(f"cp -Rv {recipe_path}{env_path}")
         shutil.copytree(recipe_path, env_path)
+    # else create the env path and populate it with a stub spack.yaml
+    # and empty package repo.
     else:
         echo(f"mkdir {env_path}")
         os.makedirs(env_path)
 
-        # create the stub repository
+        # create the stub package repo
         echo(f"mkdir {env_repo_path}")
         os.makedirs(env_repo_path)
         with (env_repo_path / "repo.yaml").open(mode="w") as f:
@@ -237,32 +399,23 @@ if __name__ == "__main__":
 
         os.makedirs(env_repo_path / "packages")
 
-        variants = {
-            "zen2":  ["+mpi"],
-            "zen3":  ["+mpi"],
-            "a100":  ["+mpi", "+cuda", "cuda_arch=80"],
-            "gh200": ["+mpi", "+cuda", "cuda_arch=90"],
-        }
+        config['variants'] = global_variants[args.uarch]
 
-        specs = ""
-        if args.specs is not None:
-            specs = args.specs
         spack_yaml_template = template_env.get_template("spack.yaml")
         with (env_path / "spack.yaml").open(mode="w") as f:
-            f.write(
-                spack_yaml_template.render(
-                    variants=variants[args.uarch],
-                    prefix=prefix,
-                    specs=specs
-                )
-            )
+            f.write(spack_yaml_template.render(config=config))
 
     with (user_config_path / "repos.yaml").open(mode="w") as f:
         f.write(f"""repos:
 - {env_repo_path}
 """);
 
-    quick_subproc(["spack", "config", "--scope=user", "add", f"config:install_tree:root:{prefix}/store"])
+    # set the spack store path (where spack will install packages)
+    with (user_config_path / "config.yaml").open(mode="w") as f:
+        f.write(f"""config:
+  install_tree:
+    root: {config['paths']['store']}
+""");
 
     #
     # finished configuring
@@ -272,13 +425,7 @@ if __name__ == "__main__":
     build_script = prefix / "build"
     build_template = template_env.get_template("build")
     with (build_script).open(mode="w") as f:
-        f.write(
-            build_template.render(
-                prefix=prefix,
-                env_path=env_path,
-                envvars=envvars,
-            )
-        )
+        f.write(build_template.render(config=config))
 
     # make the build script executable
     st = os.stat(build_script)
@@ -292,7 +439,7 @@ if __name__ == "__main__":
 
     # copy the clean script
     clean_script = prefix / "clean"
-    shutil.copyfile(tool_prefix / "resources/clean", clean_script)
+    shutil.copyfile(resources_path()/ "clean", clean_script)
     st = os.stat(clean_script)
     os.chmod(clean_script, st.st_mode | stat.S_IEXEC)
 

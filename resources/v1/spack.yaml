@@ -5,11 +5,16 @@ spack:
   concretizer:
     unify: true
     reuse: true
-  specs: [{{ specs }}]
+  specs:
+    {% if config.specs %}
+    {% for spec in config.specs %}  - {{ spec }}
+    {% endfor %}
+    {% else %}  - # add specs here
+    {% endif %}
   packages:
     all:
-      compiler: ['gcc']
-      variants: [{% for v in variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
+      compiler: ['{{ config.compiler }}']
+      variants: [{% for v in config.variants %}{{ listjoiner() }} '{{ v }}'{% endfor %}]
     mpi:
       require: 'cray-mpich'
   view:
@@ -17,5 +22,5 @@ spack:
     default:
       # one of (run, roots, all)
       link: run
-      root: {{ prefix }}/view
+      root: {{ config.paths.view }}
 

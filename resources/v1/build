@@ -31,12 +31,12 @@ fingerprint() {
 
 export SPACK_COLOR=always
 
-{% for name, value in envvars.items() %}
-export {{ name }}='{{ value }}'
+{% for name, value in config.envvars.items() %}
+export {{ name }}="{{ value }}"
 {% endfor %}
 
-export prefix={{ prefix }}
-export env={{ env_path }}
+export prefix={{ config.paths.prefix }}
+export env={{ config.paths.spackenv }}
 cd $prefix
 
 echo === checking fingerprint ==============================
@@ -59,8 +59,13 @@ make -j32 -f $env/Makefile --output-sync=recurse
 
 echo == generating modules =================================
 # use the variant with --upstream-modules to generate comprehensive modules
-spack module tcl refresh --upstream-modules --delete-tree --yes-to-all
+spack -e $env module tcl refresh --upstream-modules --delete-tree --yes-to-all
+rm -rf $prefix/modules
+ln -s {{ config.paths.store }}/modules $prefix/modules
 
 echo == generating view =====================================
 spack env activate --with-view default --sh $env > activate.sh
+rm -rf $prefix/view
+ln -s {{ config.paths.store }}/env/{{ config.name }} $prefix/view
+mv activate.sh $prefix/view
 
