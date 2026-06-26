@@ -208,7 +208,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # check the arguments
-    available_uarch = ["zen2", "zen3", "gh200", "a100"]
+    available_uarch = ["zen2", "zen3", "zen4", "gh200", "a100"]
     if args.uarch not in available_uarch:
         error(f"--uarch={args.uarch} is not one of [{', '.join(available_uarch)}]")
     if not re.compile(r'^[A-Za-z][A-Za-z0-9_-]*$').fullmatch(args.name):
